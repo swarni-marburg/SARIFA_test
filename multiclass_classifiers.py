@@ -32,7 +32,7 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def calculate_topk_accuracy(outputs, targets, k=3):
+def calculate_topk_accuracy_val(outputs, targets, k=3):
     """Calculate top-k accuracy"""
     with torch.no_grad():
         batch_size = targets.size(0)
@@ -70,6 +70,53 @@ class FocalLoss(nn.Module):
             return focal_loss.sum()
         else:
             return focal_loss
+
+class Vit_small(nn.Module):
+    def __init__(self, num_classes=9, model_name='vit_small', pretrained=True):
+        super().__init__()
+        
+        # Use timm's vision transformer
+        self.backbone = timm.create_model('tiny_vit_21m_224.dist_in22k_ft_in1k', pretrained=True)
+
+        # Get feature dimensions
+        self.feature_dim = self.backbone.head.fc.in_features
+
+        # Remove the default classification head
+        self.backbone.head.fc = nn.Identity()
+
+        # Freeze all parameters
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
+        # Unfreeze only the last transformer encoder block
+        for i in range(1,3):
+            for j in range(0,2):
+                for param in self.backbone.stages[i].blocks[j].local_conv.parameters():
+                    param.requires_grad = True
+
+        # Enhanced classifier head
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(self.feature_dim, 256),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, num_classes)
+        )
+        
+        # Initialize classifier weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.classifier(features)
+
+
 
 class VisionTransformerL(nn.Module):
     """Enhanced Vision Transformer with better architecture for medical images"""
@@ -316,10 +363,13 @@ def MODEL_TRAINING(train_dataset, val_dataset, test_dataset, class_names, train_
         model = ViTBest(num_classes = len(class_names))
     elif model_type == 'vit_convformer':
         model = ViTConvformer(num_classes = len(class_names))
+    elif model_type == 'vit_small':
+        model = Vit_small(num_classes = len(class_names))    
     else:
         raise ValueError("model_type must be 'vit' or 'efficientnet'")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cpu')
     model = model.to(device)
     torch.cuda.empty_cache()
     
@@ -365,6 +415,13 @@ def MODEL_TRAINING(train_dataset, val_dataset, test_dataset, class_names, train_
         train_labels = []
         val_predictions = []
         val_targets = []
+        train_outputs = []
+        train_predictions = []
+        train_targets = []
+        train_top1_acc = 0
+        train_top2_acc = 0
+        train_top3_acc = 0
+        train_batches = 0
         for data, targets in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
             data, targets = data.to(device), targets.to(device)
             
@@ -382,8 +439,14 @@ def MODEL_TRAINING(train_dataset, val_dataset, test_dataset, class_names, train_
             _, predicted = torch.max(outputs, 1)
             train_total += targets.size(0)
             train_correct += predicted.eq(targets).sum().item()
+            train_outputs.extend(outputs.detach().cpu().numpy())
             train_preds.extend(predicted.cpu().numpy())
             train_labels.extend(targets.cpu().numpy())
+            topk_accs = calculate_topk_accuracy_val(outputs, targets, k=3)
+            train_top1_acc += topk_accs[0]
+            train_top2_acc += topk_accs[1]
+            train_top3_acc += topk_accs[2]
+            train_batches +=1
         
         # Compute training metrics
         train_cm = confusion_matrix(train_labels, train_preds, labels=list(range(len(classes))))
@@ -392,8 +455,7 @@ def MODEL_TRAINING(train_dataset, val_dataset, test_dataset, class_names, train_
         train_f1 = f1_score(train_labels, train_preds, average=None, zero_division=0)
         train_per_class_acc = train_cm.diagonal() / train_cm.sum(axis=1)
         train_acc = sum(train_cm.diagonal())/sum(sum(train_cm))
-        train_topk_accs = calculate_topk_accuracy(train_preds, train_labels, k=3)
-        print(f'Top k acc : {train_topk_accs}')
+        logging.info(f'  Train Top-1: {train_top1_acc/train_batches:.2f}%, Top-2: {train_top2_acc/train_batches:.2f}%, Top-3: {train_top3_acc/train_batches:.2f}%')
         train_specificity = []
         for i in range(len(classes)):
             TP = train_cm[i, i]
@@ -422,7 +484,7 @@ def MODEL_TRAINING(train_dataset, val_dataset, test_dataset, class_names, train_
                 val_targets.extend(targets.cpu().numpy())
                 
                 # Calculate top-k accuracies
-                topk_accs = calculate_topk_accuracy(outputs, targets, k=3)
+                topk_accs = calculate_topk_accuracy_val(outputs, targets, k=3)
                 val_top1_acc += topk_accs[0]
                 val_top2_acc += topk_accs[1]
                 val_top3_acc += topk_accs[2]
